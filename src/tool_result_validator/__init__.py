@@ -22,9 +22,7 @@ class ToolResultError(Exception):
     def __init__(self, tool_name: str, errors: list[str]) -> None:
         self.tool_name = tool_name
         self.errors = errors
-        super().__init__(
-            f"Tool '{tool_name}' result validation failed: {'; '.join(errors)}"
-        )
+        super().__init__(f"Tool '{tool_name}' result validation failed: {'; '.join(errors)}")
 
 
 # ---------------------------------------------------------------------------
@@ -72,20 +70,14 @@ def _check(schema: dict, value: Any, path: str, errors: list[str]) -> None:
         elif type_name == "integer":
             # JSON Schema: integer must not be a bool (bool is subclass of int)
             if not isinstance(value, int) or isinstance(value, bool):
-                errors.append(
-                    f"{path}: expected integer, got {type(value).__name__}"
-                )
+                errors.append(f"{path}: expected integer, got {type(value).__name__}")
                 return  # stop: sub-checks won't make sense on wrong type
         elif type_name == "number":
             if isinstance(value, bool) or not isinstance(value, (int, float)):
-                errors.append(
-                    f"{path}: expected number, got {type(value).__name__}"
-                )
+                errors.append(f"{path}: expected number, got {type(value).__name__}")
                 return
         elif not isinstance(value, expected):  # type: ignore[arg-type]
-            errors.append(
-                f"{path}: expected {type_name}, got {type(value).__name__}"
-            )
+            errors.append(f"{path}: expected {type_name}, got {type(value).__name__}")
             return  # stop: sub-checks won't make sense on wrong type
 
     # ---- object-specific checks -------------------------------------------

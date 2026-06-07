@@ -186,31 +186,37 @@ def test_properties_field_wrong_type():
 
 def test_properties_nested_pass():
     v = ToolResultValidator()
-    v.register("nested", {
-        "type": "object",
-        "properties": {
-            "meta": {
-                "type": "object",
-                "required": ["created"],
-                "properties": {"created": {"type": "string"}},
-            }
+    v.register(
+        "nested",
+        {
+            "type": "object",
+            "properties": {
+                "meta": {
+                    "type": "object",
+                    "required": ["created"],
+                    "properties": {"created": {"type": "string"}},
+                }
+            },
         },
-    })
+    )
     r = v.validate("nested", {"meta": {"created": "2024-01-01"}})
     assert r.ok is True
 
 
 def test_properties_nested_fail():
     v = ToolResultValidator(strict=False)
-    v.register("nested", {
-        "type": "object",
-        "properties": {
-            "meta": {
-                "type": "object",
-                "required": ["created"],
-            }
+    v.register(
+        "nested",
+        {
+            "type": "object",
+            "properties": {
+                "meta": {
+                    "type": "object",
+                    "required": ["created"],
+                }
+            },
         },
-    })
+    )
     r = v.validate("nested", {"meta": {}})  # missing "created"
     assert r.ok is False
     assert any("created" in e for e in r.errors)
@@ -370,3 +376,86 @@ def test_multiple_tools_independent():
     good_b = v.validate("tool_b", 7)
     assert bad_a.ok is False
     assert good_b.ok is True
+
+
+# ---------------------------------------------------------------------------
+# 14. type: "number" (accepts int and float, rejects bool)
+# ---------------------------------------------------------------------------
+
+
+def test_type_number_accepts_int():
+    v = ToolResultValidator()
+    v.register("t", {"type": "number"})
+    assert v.validate("t", 5).ok is True
+
+
+def test_type_number_accepts_float():
+    v = ToolResultValidator()
+    v.register("t", {"type": "number"})
+    assert v.validate("t", 5.5).ok is True
+
+
+def test_type_number_rejects_bool():
+    # JSON Schema: booleans are not numbers
+    v = ToolResultValidator(strict=False)
+    v.register("t", {"type": "number"})
+    r = v.validate("t", True)
+    assert r.ok is False
+    assert any("number" in e for e in r.errors)
+
+
+def test_type_number_rejects_string():
+    v = ToolResultValidator(strict=False)
+    v.register("t", {"type": "number"})
+    r = v.validate("t", "3.14")
+    assert r.ok is False
+
+
+# ---------------------------------------------------------------------------
+# 15. Unknown type keyword is permissive (passes through)
+# ---------------------------------------------------------------------------
+
+
+def test_unknown_type_keyword_passes():
+    v = ToolResultValidator(strict=False)
+    v.register("t", {"type": "geo-coordinate"})  # not a supported type
+    assert v.validate("t", "anything").ok is True
+
+
+# ---------------------------------------------------------------------------
+# 16. validated_async() in non-strict mode passes the result through
+# ---------------------------------------------------------------------------
+
+
+def test_validated_async_non_strict_passes_through():
+    v = ToolResultValidator(strict=False)
+    v.register("fetch", {"type": "object"})
+
+    @v.validated_async("fetch")
+    async def fetch(url):
+        return "not a dict"  # invalid, but non-strict must not raise
+
+    # Non-strict mode never raises; the original return value is preserved.
+    assert asyncio.run(fetch("https://example.com")) == "not a dict"
+
+
+# ---------------------------------------------------------------------------
+# 17. Wrong top-level type short-circuits object sub-checks
+# ---------------------------------------------------------------------------
+
+
+def test_wrong_top_type_skips_required_checks():
+    v = ToolResultValidator(strict=False)
+    v.register(
+        "t",
+        {
+            "type": "object",
+            "required": ["a"],
+            "properties": {"a": {"type": "string"}},
+        },
+    )
+    r = v.validate("t", 123)  # not a dict
+    assert r.ok is False
+    # Only the type error; required/property checks must not fire on a non-dict.
+    assert len(r.errors) == 1
+    assert "object" in r.errors[0]

@@ -1,81 +1,117 @@
-# token-budget-py
+# tool-result-validator
 
-[![PyPI](https://img.shields.io/pypi/v/token-budget-py.svg)](https://pypi.org/project/token-budget-py/)
-[![Python](https://img.shields.io/pypi/pyversions/token-budget-py.svg)](https://pypi.org/project/token-budget-py/)
+[![PyPI](https://img.shields.io/pypi/v/tool-result-validator.svg)](https://pypi.org/project/tool-result-validator/)
+[![Python](https://img.shields.io/pypi/pyversions/tool-result-validator.svg)](https://pypi.org/project/tool-result-validator/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-**Thread-safe shared token + USD budget for concurrent LLM tasks.**
+**Validate tool-call results against registered JSON-Schema-style schemas before
+handing them back to the LLM.**
 
-Fan-out workloads — agents, parallel summarizers, batch evals — race many
-tasks to consume from one shared budget. This library is a small,
-zero-dependency counter with two axes (tokens, USD) that returns
-`BudgetExceeded` when a record would push past a configured cap.
-
-Sibling to the Rust crate
-[`token-budget-pool`](https://crates.io/crates/token-budget-pool).
+When an LLM agent calls a tool, the tool's return value is fed straight back
+into the model. If that value is malformed — a missing field, a string where an
+integer was expected, a `null` where an object should be — the model often
+hallucinates around the bad data instead of failing loudly. This library catches
+those problems at the boundary, with a tiny hand-rolled checker and **zero
+runtime dependencies**.
 
 ## Install
 
 ```bash
-pip install token-budget-py
+pip install tool-result-validator
 ```
 
 ## Use
 
+Register a schema per tool, then validate results before returning them:
+
 ```python
-from token_budget import BudgetPool, BudgetExceeded
+from tool_result_validator import ToolResultValidator, ToolResultError
 
-pool = BudgetPool(token_cap=1_000_000, usd_cap=10.0)
+validator = ToolResultValidator()  # strict=True by default
 
+validator.register("get_user", {
+    "type": "object",
+    "required": ["id", "name"],
+    "properties": {
+        "id": {"type": "integer"},
+        "name": {"type": "string"},
+    },
+})
+
+# In strict mode, a bad result raises ToolResultError:
 try:
-    pool.record(tokens=1200, usd=0.0036)
-except BudgetExceeded as e:
-    # tell this worker to skip
-    print(f"out of budget: {e}")
+    validator.validate("get_user", {"id": "oops"})  # id wrong type, name missing
+except ToolResultError as e:
+    print(e.tool_name)  # "get_user"
+    print(e.errors)     # ['get_user.id: expected integer, got str', "get_user: missing required field 'name'"]
 ```
 
-Two-phase commit (reserve before the LLM call, commit the actual usage):
+Tools with **no registered schema always pass** — registration is opt-in, so you
+can adopt the validator incrementally.
+
+### Non-strict mode
+
+Pass `strict=False` to get a `ValidationResult` back instead of an exception:
 
 ```python
-with pool.reserve(tokens=2000, usd=0.012) as r:
-    result = call_llm(prompt)
-    r.commit(tokens=result.usage.total_tokens, usd=result.cost_usd)
+validator = ToolResultValidator(strict=False)
+validator.register("search", {"type": "array", "items": {"type": "string"}})
+
+result = validator.validate("search", ["alpha", 42, "gamma"])
+result.ok       # False
+result.errors   # ['search[1]: expected string, got int']
+result.result   # the original value, unchanged
 ```
 
-If the `with` block exits without `r.commit()` (e.g. the LLM call raised),
-the reservation is auto-released — no orphaned slots.
+### Decorators
 
-Either axis is optional:
+Wrap a tool function so its return value is validated automatically:
 
 ```python
-only_tokens = BudgetPool(token_cap=500_000)        # USD unbounded
-only_usd    = BudgetPool(usd_cap=5.0)              # tokens unbounded
-unbounded   = BudgetPool()                         # both unbounded (counter only)
+@validator.validated("get_user")
+def get_user(uid: int) -> dict:
+    return fetch_from_db(uid)
+
+@validator.validated_async("get_user")
+async def get_user_async(uid: int) -> dict:
+    return await fetch_from_db(uid)
 ```
 
-Atomic read of current state:
+In strict mode, a bad return value raises `ToolResultError`. In either mode the
+original return value is passed through unchanged.
+
+## Supported schema keywords
+
+A deliberately small subset of JSON Schema:
+
+| Keyword       | Applies to | Behaviour                                              |
+| ------------- | ---------- | ----------------------------------------------------- |
+| `type`        | any        | `string`, `integer`, `number`, `boolean`, `null`, `object`, `array` |
+| `properties`  | `object`   | Recursively validates each named field that is present |
+| `required`    | `object`   | Each listed key must be present                        |
+| `items`       | `array`    | Recursively validates every element                    |
+
+Notes:
+
+- **Booleans are not integers/numbers.** Following JSON Schema, `True` fails a
+  `{"type": "integer"}` or `{"type": "number"}` check even though `bool` is a
+  Python subclass of `int`.
+- **`number` accepts both `int` and `float`**; `integer` accepts only `int`.
+- **Unknown keywords are ignored** (permissive), so a schema with extra keys
+  won't raise — only the supported keywords are enforced.
+
+## Introspection
 
 ```python
-snap = pool.snapshot()
-snap.tokens_used         # 1200
-snap.usd_remaining       # 9.9964
-snap.tokens_remaining    # 998800 (cap - used - reserved)
+validator.schemas()  # shallow copy of {tool_name: schema}; safe to mutate
 ```
 
 ## What it does NOT do
 
-- No async runtime lock-in. Works under `asyncio`, `trio`, threads, sync.
-  The internal lock is a plain `threading.Lock` (held only for the
-  microseconds of a counter update).
-- No HTTP. Doesn't talk to any LLM provider.
-- No cost calculation. Wrap a cost calculator that returns USD per call
-  and feed the result into `record`. (See `claude-cost`, `openai-cost`,
-  `gemini-cost`, `bedrock-cost` on crates.io for Rust cost calculators
-  with the same authorship.)
-- No persistence. Counts live in process. For multi-process / multi-host
-  budgets, wrap a Redis or DB increment instead.
-- No automatic rollover. Call `pool.reset()` from your own cron / time
-  loop if you want a periodic window.
+- No full JSON Schema. No `enum`, `pattern`, `minimum`, `additionalProperties`,
+  `$ref`, etc. — just the keywords above.
+- No network or LLM calls. It only inspects values you pass it.
+- No coercion. It validates; it never rewrites your data.
 
 ## License
 
